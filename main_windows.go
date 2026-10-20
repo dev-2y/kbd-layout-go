@@ -12,12 +12,20 @@ import (
 	"runtime"
 	"syscall"
 	"unsafe"
+	"golang.org/x/sys/windows"
 )
 
 func init() {
 	// The window, its message loop and the tray all belong to one OS thread.
 	runtime.LockOSThread()
 }
+
+const (
+	appName       = "LayoutTray"
+	mutexName     = `Local\LayoutTray_singleton`
+	timerLayout   = 1
+	layoutPollMS  = 500
+)
 
 func main() { os.Exit(run()) }
 
@@ -33,8 +41,10 @@ func run() int {
 	// Only one instance at a time. The handle is kept open until the process
 	// ends, which is what holds the mutex.
 	mutex, _, e := procCreateMutexW.Call(0, 0, uintptr(unsafe.Pointer(utf16Ptr(mutexName))))
-	if mutex != 0 && errnoOf(e) == errorAlreadyExists {
-		return 0
+	if mutex != 0 {
+		if err, ok := e.(windows.Errno); ok && err == windows.ERROR_ALREADY_EXISTS {
+			return 0
+		}
 	}
 
 	procSetProcessDPIAware.Call()

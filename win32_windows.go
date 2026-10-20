@@ -2,27 +2,27 @@
 
 package main
 
-// Thin Win32 layer on top of the standard library's syscall package: no
+// Thin Win32 layer using golang.org/x/sys/windows package: no
 // third-party modules. Pointers handed to the OS are always converted inline in
 // the argument list of LazyProc.Call (which is //go:uintptrescapes), so they
 // stay valid for the duration of the call.
 
 import (
-	"syscall"
 	"unicode/utf16"
 	"unsafe"
+	"golang.org/x/sys/windows"
 )
 
 // sysDLL loads a DLL by absolute System32 path, so a look-alike DLL sitting
 // next to the executable can never be picked up.
-func sysDLL(name string) *syscall.LazyDLL {
-	var buf [syscall.MAX_PATH]uint16
-	r, _, _ := syscall.NewLazyDLL("kernel32.dll").NewProc("GetSystemDirectoryW").
+func sysDLL(name string) *windows.LazyDLL {
+	var buf [windows.MAX_PATH]uint16
+	r, _, _ := windows.NewLazySystemDLL("kernel32.dll").NewProc("GetSystemDirectoryW").
 		Call(uintptr(unsafe.Pointer(&buf[0])), uintptr(len(buf)))
 	if r == 0 || r >= uintptr(len(buf)) {
-		return syscall.NewLazyDLL(name)
+		return windows.NewLazyDLL(name)
 	}
-	return syscall.NewLazyDLL(syscall.UTF16ToString(buf[:r]) + `\` + name)
+	return windows.NewLazyDLL(windows.UTF16ToString(buf[:r]) + `\` + name)
 }
 
 var (
@@ -30,9 +30,11 @@ var (
 	dllUser32   = sysDLL("user32.dll")
 	dllGdi32    = sysDLL("gdi32.dll")
 	dllShell32  = sysDLL("shell32.dll")
+	dllAdvapi32 = sysDLL("advapi32.dll")
 
 	procCreateMutexW       = dllKernel32.NewProc("CreateMutexW")
 	procGetModuleHandleW   = dllKernel32.NewProc("GetModuleHandleW")
+	procGetModuleFileNameW = dllKernel32.NewProc("GetModuleFileNameW")
 	procGetCurrentThreadID = dllKernel32.NewProc("GetCurrentThreadId")
 
 	procRegisterClassExW       = dllUser32.NewProc("RegisterClassExW")
@@ -69,6 +71,13 @@ var (
 	procCreateBitmap       = dllGdi32.NewProc("CreateBitmap")
 
 	procShellNotifyIconW = dllShell32.NewProc("Shell_NotifyIconW")
+
+	// advapi32
+	procRegOpenKeyExW    = dllAdvapi32.NewProc("RegOpenKeyExW")
+	procRegQueryValueExW = dllAdvapi32.NewProc("RegQueryValueExW")
+	procRegSetValueExW   = dllAdvapi32.NewProc("RegSetValueExW")
+	procRegDeleteValueW  = dllAdvapi32.NewProc("RegDeleteValueW")
+	procRegCloseKey      = dllAdvapi32.NewProc("RegCloseKey")
 )
 
 const (
@@ -92,15 +101,22 @@ const (
 	nifTip     = 0x04
 
 	mfString = 0x0000
+	mfSeparator = 0x0800
+	mfChecked = 0x0008
+	mfUnchecked = 0x0000
 
 	tpmRightButton = 0x0002
 
 	smCXSmIcon         = 49
 	wsOverlapped       = 0x00000000
-	errorAlreadyExists = syscall.Errno(183)
 
 	biRGB        = 0
 	dibRGBColors = 0
+
+	// Registry constants
+	hkeyCurrentUser = uintptr(0x80000001)
+	keyQueryValue   = 0x0001
+	keySetValue     = 0x0002
 )
 
 type point struct{ X, Y int32 }
@@ -185,11 +201,11 @@ type bitmapInfo struct {
 // utf16Ptr converts a Go string to a NUL-terminated UTF-16 string. The result
 // must be converted to uintptr inline in the Call argument list.
 func utf16Ptr(s string) *uint16 {
-	p, err := syscall.UTF16PtrFromString(s)
+	p, err := windows.UTF16PtrFromString(s)
 	if err != nil { // embedded NUL: cut the string there, like a C string
 		for i := 0; i < len(s); i++ {
 			if s[i] == 0 {
-				p, _ = syscall.UTF16PtrFromString(s[:i])
+				p, _ = windows.UTF16PtrFromString(s[:i])
 				break
 			}
 		}
@@ -218,13 +234,6 @@ func copyUTF16(dst []uint16, s string) {
 	}
 }
 
-func errnoOf(e error) syscall.Errno {
-	if n, ok := e.(syscall.Errno); ok {
-		return n
-	}
-	return 0
-}
-
 func loword(v uintptr) uint16 { return uint16(v) }
 
 func postMessage(hwnd uintptr, message uint32, wparam, lparam uintptr) bool {
@@ -235,4 +244,56 @@ func postMessage(hwnd uintptr, message uint32, wparam, lparam uintptr) bool {
 func shellNotifyIcon(message uint32, nid *notifyIconData) bool {
 	r, _, _ := procShellNotifyIconW.Call(uintptr(message), uintptr(unsafe.Pointer(nid)))
 	return r != 0
+}
+
+// smallIconSize is the edge, in pixels, of a tray icon at the current DPI.
+func smallIconSize() int {
+	r, _, _ := procGetSystemMetrics.Call(smCXSmIcon)
+	if sz := int(int32(r)); sz >= 16 {
+		return sz
+	}
+	return 16
+}
+
+// iconFromBGRA turns sz x sz premultiplied BGRA pixels into an HICON (32-bit
+// colour bitmap with alpha, plus an all-zero AND mask so alpha decides every
+// pixel). Returns 0 on failure; the caller owns the icon.
+func iconFromBGRA(sz int, pixels []byte) uintptr {
+	if len(pixels) != sz*sz*4 {
+		return 0
+	}
+	var bi bitmapInfo
+	bi.Header.Size = uint32(unsafe.Sizeof(bi.Header))
+	bi.Header.Width = int32(sz)
+	bi.Header.Height = -int32(sz) // top-down
+	bi.Header.Planes = 1
+	bi.Header.BitCount = 32
+	bi.Header.Compression = biRGB
+
+	dc, _, _ := procCreateCompatibleDC.Call(0)
+	if dc == 0 {
+		return 0
+	}
+	defer procDeleteDC.Call(dc)
+
+	var bits unsafe.Pointer
+	colorBmp, _, _ := procCreateDIBSection.Call(dc, uintptr(unsafe.Pointer(&bi)), dibRGBColors,
+		uintptr(unsafe.Pointer(&bits)), 0, 0)
+	if colorBmp == 0 || bits == nil {
+		return 0
+	}
+	defer procDeleteObject.Call(colorBmp)
+	copy(unsafe.Slice((*byte)(bits), len(pixels)), pixels)
+
+	maskBits := make([]byte, (((sz+31)/32)*4)*sz)
+	maskBmp, _, _ := procCreateBitmap.Call(uintptr(sz), uintptr(sz), 1, 1,
+		uintptr(unsafe.Pointer(&maskBits[0])))
+	if maskBmp == 0 {
+		return 0
+	}
+	defer procDeleteObject.Call(maskBmp)
+
+	info := iconInfo{FIcon: 1, HbmMask: maskBmp, HbmColor: colorBmp}
+	icon, _, _ := procCreateIconIndirect.Call(uintptr(unsafe.Pointer(&info)))
+	return icon
 }

@@ -35,11 +35,12 @@ func decodeFlag(data []byte) (*Flag, error) {
 	rgba := image.NewRGBA(image.Rect(0, 0, b.Dx(), b.Dy()))
 	draw.Draw(rgba, rgba.Bounds(), img, b.Min, draw.Src)
 	f := &Flag{W: b.Dx(), H: b.Dy(), BGRA: make([]byte, len(rgba.Pix))}
+	// Convert RGBA to BGRA by swapping R and B channels
 	for i := 0; i < len(rgba.Pix); i += 4 {
-		f.BGRA[i+0] = rgba.Pix[i+2]
-		f.BGRA[i+1] = rgba.Pix[i+1]
-		f.BGRA[i+2] = rgba.Pix[i+0]
-		f.BGRA[i+3] = rgba.Pix[i+3]
+		f.BGRA[i+0] = rgba.Pix[i+2] // B
+		f.BGRA[i+1] = rgba.Pix[i+1] // G
+		f.BGRA[i+2] = rgba.Pix[i+0] // R
+		f.BGRA[i+3] = rgba.Pix[i+3] // A
 	}
 	return f, nil
 }

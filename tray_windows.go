@@ -7,13 +7,9 @@ import "unsafe"
 const (
 	wmTrayIcon = wmApp + 1
 
-	idExit        = 1004
-	trayUID       = 1
-	timerLayout   = 1
-	layoutPollMS  = 500
-	appName       = "LayoutTray"
-	mutexName     = `Local\LayoutTray_singleton`
-	menuExitLabel = "Sair"
+	idAutostart = 1002
+	idExit      = 1004
+	trayUID     = 1
 )
 
 // Everything here belongs to the UI thread.
@@ -88,12 +84,29 @@ func checkLayout() {
 
 // ---------------------------------------------------------------- tray menu
 
+func checkedFlag(on bool) uintptr {
+	if on {
+		return mfChecked
+	}
+	return mfUnchecked
+}
+
 func showMenu() {
 	menu, _, _ := procCreatePopupMenu.Call()
 	if menu == 0 {
 		return
 	}
-	procAppendMenuW.Call(menu, mfString, idExit, uintptr(unsafe.Pointer(utf16Ptr(menuExitLabel))))
+
+	// "Iniciar com Windows" (Start with Windows) - with checkmark
+	autostartLabel := "Iniciar com Windows"
+	procAppendMenuW.Call(menu, mfString|checkedFlag(autostartEnabled()), idAutostart,
+		uintptr(unsafe.Pointer(utf16Ptr(autostartLabel))))
+
+	// Separator
+	procAppendMenuW.Call(menu, mfSeparator, 0, 0)
+
+	// "Sair" (Exit)
+	procAppendMenuW.Call(menu, mfString, idExit, uintptr(unsafe.Pointer(utf16Ptr("Sair"))))
 
 	var cursor point
 	procGetCursorPos.Call(uintptr(unsafe.Pointer(&cursor)))
@@ -126,7 +139,10 @@ func wndProc(hwnd, message, wparam, lparam uintptr) uintptr {
 		return 0
 
 	case wmCommand:
-		if loword(wparam) == idExit {
+		switch loword(wparam) {
+		case idAutostart:
+			autostartToggle()
+		case idExit:
 			procDestroyWindow.Call(hwnd)
 		}
 		return 0
